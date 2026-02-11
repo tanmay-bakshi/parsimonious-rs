@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
@@ -67,6 +67,109 @@ pub(crate) struct CustomExpr {
     pub(crate) arity: usize,
     pub(crate) grammar: Py<PyAny>,
     pub(crate) callable_name: String,
+}
+
+enum NativeNode {
+    Plain {
+        expr: Py<PyAny>,
+        start: usize,
+        end: usize,
+        children: Vec<usize>,
+    },
+    Regex {
+        expr: Py<PyAny>,
+        start: usize,
+        end: usize,
+        match_obj: Py<PyAny>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum FastCacheSlot {
+    Unknown,
+    InProgress,
+    Done(Option<usize>),
+}
+
+struct FastCache {
+    len: usize,
+    per_expr: HashMap<usize, Vec<FastCacheSlot>>,
+}
+
+impl FastCache {
+    fn new(len: usize) -> Self {
+        Self {
+            len,
+            per_expr: HashMap::new(),
+        }
+    }
+
+    fn slots_for_expr_mut(&mut self, expr_id: usize) -> &mut Vec<FastCacheSlot> {
+        self.per_expr.entry(expr_id).or_insert_with(|| {
+            let mut slots: Vec<FastCacheSlot> = Vec::with_capacity(self.len + 1);
+            slots.resize_with(self.len + 1, || FastCacheSlot::Unknown);
+            slots
+        })
+    }
+}
+
+enum CompiledKind {
+    TokenMatcher {
+        literal: Py<PyAny>,
+    },
+    Literal {
+        literal: Py<PyAny>,
+    },
+    Regex {
+        re: Py<PyAny>,
+    },
+    Sequence {
+        members: Vec<usize>,
+    },
+    OneOf {
+        members: Vec<usize>,
+    },
+    Lookahead {
+        member: usize,
+        negativity: bool,
+    },
+    Quantifier {
+        member: usize,
+        min: usize,
+        max: Option<usize>,
+    },
+}
+
+struct CompiledNode {
+    expr: Py<PyAny>,
+    kind: CompiledKind,
+}
+
+struct CompiledGraph {
+    root: usize,
+    nodes: Vec<CompiledNode>,
+}
+
+#[derive(Clone, Copy)]
+enum CompiledCacheSlot {
+    Unknown,
+    InProgress,
+    Done(Option<usize>),
+}
+
+struct CompiledCache {
+    len: usize,
+    per_node: Vec<Vec<CompiledCacheSlot>>,
+}
+
+impl CompiledCache {
+    fn new(node_count: usize, len: usize) -> Self {
+        let row = vec![CompiledCacheSlot::Unknown; len + 1];
+        Self {
+            len,
+            per_node: vec![row; node_count],
+        }
+    }
 }
 
 fn py_repr(obj: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -236,6 +339,432 @@ fn update_error(
     error.setattr("expr", expr_any)?;
     error.setattr("pos", pos)?;
     Ok(())
+}
+
+fn contains_custom_expr(
+    py: Python<'_>,
+    expr_any: &Bound<'_, PyAny>,
+    visited: &mut HashSet<usize>,
+) -> PyResult<bool> {
+    let _ = py;
+    let expr_id = expr_any.as_ptr() as usize;
+    if visited.contains(&expr_id) {
+        return Ok(false);
+    }
+    visited.insert(expr_id);
+
+    if expr_any.cast::<CustomExpr>().is_ok() {
+        return Ok(true);
+    }
+
+    if let Ok(seq) = expr_any.cast::<Sequence>() {
+        let seq_ref = seq.borrow();
+        let members = seq_ref.members.bind(expr_any.py());
+        for member in members.iter() {
+            if contains_custom_expr(expr_any.py(), &member, visited)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    if let Ok(oneof) = expr_any.cast::<OneOf>() {
+        let oneof_ref = oneof.borrow();
+        let members = oneof_ref.members.bind(expr_any.py());
+        for member in members.iter() {
+            if contains_custom_expr(expr_any.py(), &member, visited)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    if let Ok(lookahead) = expr_any.cast::<Lookahead>() {
+        let look_ref = lookahead.borrow();
+        let members = look_ref.members.bind(expr_any.py());
+        if members.len() == 0 {
+            return Ok(false);
+        }
+        let member0 = members.get_item(0)?;
+        return contains_custom_expr(expr_any.py(), &member0, visited);
+    }
+
+    if let Ok(q) = expr_any.cast::<Quantifier>() {
+        let q_ref = q.borrow();
+        let members = q_ref.members.bind(expr_any.py());
+        if members.len() == 0 {
+            return Ok(false);
+        }
+        let member0 = members.get_item(0)?;
+        return contains_custom_expr(expr_any.py(), &member0, visited);
+    }
+
+    Ok(false)
+}
+
+fn push_plain_node(
+    arena: &mut Vec<NativeNode>,
+    expr: &Bound<'_, PyAny>,
+    start: usize,
+    end: usize,
+    children: Vec<usize>,
+) -> usize {
+    let idx = arena.len();
+    arena.push(NativeNode::Plain {
+        expr: expr.clone().unbind(),
+        start,
+        end,
+        children,
+    });
+    idx
+}
+
+fn push_regex_node(
+    arena: &mut Vec<NativeNode>,
+    expr: &Bound<'_, PyAny>,
+    start: usize,
+    end: usize,
+    match_obj: Py<PyAny>,
+) -> usize {
+    let idx = arena.len();
+    arena.push(NativeNode::Regex {
+        expr: expr.clone().unbind(),
+        start,
+        end,
+        match_obj,
+    });
+    idx
+}
+
+fn native_node_end(arena: &[NativeNode], idx: usize) -> PyResult<usize> {
+    match arena.get(idx) {
+        Some(NativeNode::Plain { end, .. }) => Ok(*end),
+        Some(NativeNode::Regex { end, .. }) => Ok(*end),
+        None => Err(PyRuntimeError::new_err(
+            "Native parse node index out of bounds.",
+        )),
+    }
+}
+
+fn materialize_native_node(
+    py: Python<'_>,
+    text: &Bound<'_, PyAny>,
+    arena: &[NativeNode],
+    idx: usize,
+    memo: &mut HashMap<usize, Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    if let Some(existing) = memo.get(&idx) {
+        return Ok(existing.clone_ref(py));
+    }
+
+    let py_node = match arena.get(idx) {
+        Some(NativeNode::Plain {
+            expr,
+            start,
+            end,
+            children,
+        }) => {
+            let mut py_children: Vec<Py<PyAny>> = Vec::with_capacity(children.len());
+            for child_idx in children.iter().copied() {
+                let child = materialize_native_node(py, text, arena, child_idx, memo)?;
+                py_children.push(child);
+            }
+            new_node(py, expr.bind(py), text, *start, *end, &py_children)?
+        }
+        Some(NativeNode::Regex {
+            expr,
+            start,
+            end,
+            match_obj,
+        }) => new_regex_node(
+            py,
+            expr.bind(py),
+            text,
+            *start,
+            *end,
+            match_obj.clone_ref(py),
+        )?,
+        None => {
+            return Err(PyRuntimeError::new_err(
+                "Native parse node index out of bounds.",
+            ));
+        }
+    };
+
+    memo.insert(idx, py_node.clone_ref(py));
+    Ok(py_node)
+}
+
+fn compile_graph(py: Python<'_>, root: &Bound<'_, PyAny>) -> PyResult<CompiledGraph> {
+    fn compile_node(
+        py: Python<'_>,
+        expr_any: &Bound<'_, PyAny>,
+        id_map: &mut HashMap<usize, usize>,
+        nodes: &mut Vec<Option<CompiledNode>>,
+    ) -> PyResult<usize> {
+        let expr_id = expr_any.as_ptr() as usize;
+        if let Some(existing_idx) = id_map.get(&expr_id) {
+            return Ok(*existing_idx);
+        }
+
+        let idx = nodes.len();
+        id_map.insert(expr_id, idx);
+        nodes.push(None);
+
+        let expr_py = expr_any.clone().unbind();
+        let kind = if let Ok(tok) = expr_any.cast::<TokenMatcher>() {
+            let tok_ref = tok.borrow();
+            CompiledKind::TokenMatcher {
+                literal: tok_ref.literal.clone_ref(py),
+            }
+        } else if let Ok(lit) = expr_any.cast::<Literal>() {
+            let lit_ref = lit.borrow();
+            CompiledKind::Literal {
+                literal: lit_ref.literal.clone_ref(py),
+            }
+        } else if let Ok(regex) = expr_any.cast::<Regex>() {
+            let regex_ref = regex.borrow();
+            CompiledKind::Regex {
+                re: regex_ref.re.clone_ref(py),
+            }
+        } else if let Ok(seq) = expr_any.cast::<Sequence>() {
+            let seq_ref = seq.borrow();
+            let members = seq_ref.members.bind(py);
+            let mut compiled_members: Vec<usize> = Vec::with_capacity(members.len());
+            for member in members.iter() {
+                let member_idx = compile_node(py, &member, id_map, nodes)?;
+                compiled_members.push(member_idx);
+            }
+            CompiledKind::Sequence {
+                members: compiled_members,
+            }
+        } else if let Ok(oneof) = expr_any.cast::<OneOf>() {
+            let oneof_ref = oneof.borrow();
+            let members = oneof_ref.members.bind(py);
+            let mut compiled_members: Vec<usize> = Vec::with_capacity(members.len());
+            for member in members.iter() {
+                let member_idx = compile_node(py, &member, id_map, nodes)?;
+                compiled_members.push(member_idx);
+            }
+            CompiledKind::OneOf {
+                members: compiled_members,
+            }
+        } else if let Ok(lookahead) = expr_any.cast::<Lookahead>() {
+            let look_ref = lookahead.borrow();
+            let members = look_ref.members.bind(py);
+            if members.len() == 0 {
+                return Err(PyRuntimeError::new_err(
+                    "Lookahead expression has no member.",
+                ));
+            }
+            let member0 = members.get_item(0)?;
+            let member_idx = compile_node(py, &member0, id_map, nodes)?;
+            CompiledKind::Lookahead {
+                member: member_idx,
+                negativity: look_ref.negativity,
+            }
+        } else if let Ok(q) = expr_any.cast::<Quantifier>() {
+            let q_ref = q.borrow();
+            let members = q_ref.members.bind(py);
+            if members.len() == 0 {
+                return Err(PyRuntimeError::new_err(
+                    "Quantifier expression has no member.",
+                ));
+            }
+            let member0 = members.get_item(0)?;
+            let member_idx = compile_node(py, &member0, id_map, nodes)?;
+            CompiledKind::Quantifier {
+                member: member_idx,
+                min: q_ref.min,
+                max: q_ref.max,
+            }
+        } else if expr_any.cast::<CustomExpr>().is_ok() {
+            return Err(PyRuntimeError::new_err(
+                "Custom expressions are not supported by the compiled matcher.",
+            ));
+        } else {
+            return Err(PyRuntimeError::new_err(
+                "Unsupported expression in compiled matcher.",
+            ));
+        };
+
+        nodes[idx] = Some(CompiledNode {
+            expr: expr_py,
+            kind,
+        });
+        Ok(idx)
+    }
+
+    let mut id_map: HashMap<usize, usize> = HashMap::new();
+    let mut pending_nodes: Vec<Option<CompiledNode>> = Vec::new();
+    let root_idx = compile_node(py, root, &mut id_map, &mut pending_nodes)?;
+
+    let mut nodes: Vec<CompiledNode> = Vec::with_capacity(pending_nodes.len());
+    for pending in pending_nodes {
+        let node = match pending {
+            Some(node) => node,
+            None => {
+                return Err(PyRuntimeError::new_err(
+                    "Compiled graph node placeholder was not initialized.",
+                ));
+            }
+        };
+        nodes.push(node);
+    }
+
+    Ok(CompiledGraph {
+        root: root_idx,
+        nodes,
+    })
+}
+
+fn compiled_match_core(
+    py: Python<'_>,
+    graph: &CompiledGraph,
+    node_idx: usize,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut CompiledCache,
+    error: &Bound<'_, PyAny>,
+) -> PyResult<Option<usize>> {
+    if pos > cache.len {
+        return Ok(None);
+    }
+    if node_idx >= graph.nodes.len() {
+        return Err(PyRuntimeError::new_err(
+            "Compiled matcher node index out of bounds.",
+        ));
+    }
+
+    match cache.per_node[node_idx][pos] {
+        CompiledCacheSlot::Unknown => {
+            cache.per_node[node_idx][pos] = CompiledCacheSlot::InProgress;
+        }
+        CompiledCacheSlot::InProgress => {
+            let node = &graph.nodes[node_idx];
+            let ty = left_recursion_error_type(py)?;
+            let inst = ty.call1((text, -1isize, node.expr.bind(py)))?;
+            return Err(PyErr::from_value(inst));
+        }
+        CompiledCacheSlot::Done(end) => {
+            return Ok(end);
+        }
+    }
+
+    let result = compiled_uncached_match(py, graph, node_idx, text, pos, cache, error)?;
+    cache.per_node[node_idx][pos] = CompiledCacheSlot::Done(result);
+
+    if result.is_none() {
+        let node = &graph.nodes[node_idx];
+        update_error(py, node.expr.bind(py), pos, error)?;
+    }
+    Ok(result)
+}
+
+fn compiled_uncached_match(
+    py: Python<'_>,
+    graph: &CompiledGraph,
+    node_idx: usize,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut CompiledCache,
+    error: &Bound<'_, PyAny>,
+) -> PyResult<Option<usize>> {
+    let node = &graph.nodes[node_idx];
+    match &node.kind {
+        CompiledKind::TokenMatcher { literal } => {
+            if pos >= cache.len {
+                return Ok(None);
+            }
+            let item = text.get_item(pos)?;
+            let ty = item.getattr("type")?;
+            let ok: bool = ty.eq(literal.bind(py))?;
+            if ok {
+                return Ok(Some(pos + 1));
+            }
+            Ok(None)
+        }
+        CompiledKind::Literal { literal } => {
+            let literal_any = literal.bind(py);
+            let ok: bool = text
+                .call_method1("startswith", (literal_any, pos))?
+                .extract()?;
+            if ok {
+                let lit_len = literal_any.len()?;
+                return Ok(Some(pos + lit_len));
+            }
+            Ok(None)
+        }
+        CompiledKind::Regex { re } => {
+            let re_any = re.bind(py);
+            let m = re_any.call_method1("match", (text, pos))?;
+            if m.is_none() {
+                return Ok(None);
+            }
+            let end: usize = m.call_method0("end")?.extract()?;
+            Ok(Some(end))
+        }
+        CompiledKind::Sequence { members } => {
+            let mut new_pos = pos;
+            for member_idx in members {
+                let child_end =
+                    compiled_match_core(py, graph, *member_idx, text, new_pos, cache, error)?;
+                let Some(child_end) = child_end else {
+                    return Ok(None);
+                };
+                new_pos = child_end;
+            }
+            Ok(Some(new_pos))
+        }
+        CompiledKind::OneOf { members } => {
+            for member_idx in members {
+                let child_end =
+                    compiled_match_core(py, graph, *member_idx, text, pos, cache, error)?;
+                if child_end.is_some() {
+                    return Ok(child_end);
+                }
+            }
+            Ok(None)
+        }
+        CompiledKind::Lookahead { member, negativity } => {
+            let child_end = compiled_match_core(py, graph, *member, text, pos, cache, error)?;
+            let ok = (child_end.is_none()) == *negativity;
+            if ok {
+                return Ok(Some(pos));
+            }
+            Ok(None)
+        }
+        CompiledKind::Quantifier { member, min, max } => {
+            let mut new_pos = pos;
+            let mut count: usize = 0;
+            while new_pos < cache.len {
+                let under_max = match max {
+                    Some(max_value) => count < *max_value,
+                    None => true,
+                };
+                if under_max == false {
+                    break;
+                }
+
+                let child_end =
+                    compiled_match_core(py, graph, *member, text, new_pos, cache, error)?;
+                let Some(child_end) = child_end else {
+                    break;
+                };
+                let length = child_end.saturating_sub(new_pos);
+                count += 1;
+                if count >= *min && length == 0 {
+                    break;
+                }
+                new_pos = child_end;
+            }
+
+            if count >= *min {
+                return Ok(Some(new_pos));
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn new_node(
@@ -527,6 +1056,199 @@ fn uncached_match(
     }
 }
 
+fn fast_match_core(
+    py: Python<'_>,
+    expr_any: &Bound<'_, PyAny>,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut FastCache,
+    error: &Bound<'_, PyAny>,
+    arena: &mut Vec<NativeNode>,
+) -> PyResult<Option<usize>> {
+    let expr_id: usize = expr_any.as_ptr() as usize;
+    if pos > cache.len {
+        return Ok(None);
+    }
+
+    {
+        let slots = cache.slots_for_expr_mut(expr_id);
+        match slots[pos] {
+            FastCacheSlot::Unknown => {
+                slots[pos] = FastCacheSlot::InProgress;
+            }
+            FastCacheSlot::InProgress => {
+                let ty = left_recursion_error_type(py)?;
+                let inst = ty.call1((text, -1isize, expr_any))?;
+                return Err(PyErr::from_value(inst));
+            }
+            FastCacheSlot::Done(node_idx) => {
+                return Ok(node_idx);
+            }
+        }
+    }
+
+    let result = fast_uncached_match(py, expr_any, text, pos, cache, error, arena)?;
+
+    {
+        let slots = cache.slots_for_expr_mut(expr_id);
+        slots[pos] = FastCacheSlot::Done(result);
+    }
+
+    if result.is_none() {
+        update_error(py, expr_any, pos, error)?;
+    }
+
+    Ok(result)
+}
+
+fn fast_uncached_match(
+    py: Python<'_>,
+    expr_any: &Bound<'_, PyAny>,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut FastCache,
+    error: &Bound<'_, PyAny>,
+    arena: &mut Vec<NativeNode>,
+) -> PyResult<Option<usize>> {
+    if let Ok(tok) = expr_any.cast::<TokenMatcher>() {
+        if pos >= cache.len {
+            return Ok(None);
+        }
+        let tok_ref = tok.borrow();
+        let item = text.get_item(pos)?;
+        let ty = item.getattr("type")?;
+        let ok: bool = ty.eq(tok_ref.literal.bind(py))?;
+        if ok {
+            let end = pos + 1;
+            let idx = push_plain_node(arena, expr_any, pos, end, Vec::new());
+            return Ok(Some(idx));
+        }
+        return Ok(None);
+    }
+
+    if let Ok(lit) = expr_any.cast::<Literal>() {
+        let lit_ref = lit.borrow();
+        let literal = lit_ref.literal.bind(py);
+        let ok: bool = text.call_method1("startswith", (literal, pos))?.extract()?;
+        if ok {
+            let lit_len = literal.len()?;
+            let end = pos + lit_len;
+            let idx = push_plain_node(arena, expr_any, pos, end, Vec::new());
+            return Ok(Some(idx));
+        }
+        return Ok(None);
+    }
+
+    if let Ok(regex) = expr_any.cast::<Regex>() {
+        let regex_ref = regex.borrow();
+        let re_any = regex_ref.re.bind(py);
+        let m = re_any.call_method1("match", (text, pos))?;
+        if m.is_none() {
+            return Ok(None);
+        }
+        let end: usize = m.call_method0("end")?.extract()?;
+        let idx = push_regex_node(arena, expr_any, pos, end, m.unbind());
+        return Ok(Some(idx));
+    }
+
+    if let Ok(seq) = expr_any.cast::<Sequence>() {
+        let seq_ref = seq.borrow();
+        let members = seq_ref.members.bind(py);
+        let mut new_pos = pos;
+        let mut children: Vec<usize> = Vec::with_capacity(members.len());
+
+        for member in members.iter() {
+            let node = fast_match_core(py, &member, text, new_pos, cache, error, arena)?;
+            let Some(child_idx) = node else {
+                return Ok(None);
+            };
+            new_pos = native_node_end(arena, child_idx)?;
+            children.push(child_idx);
+        }
+
+        let idx = push_plain_node(arena, expr_any, pos, new_pos, children);
+        return Ok(Some(idx));
+    }
+
+    if let Ok(oneof) = expr_any.cast::<OneOf>() {
+        let oneof_ref = oneof.borrow();
+        let members = oneof_ref.members.bind(py);
+        for member in members.iter() {
+            let node = fast_match_core(py, &member, text, pos, cache, error, arena)?;
+            if let Some(child_idx) = node {
+                let end = native_node_end(arena, child_idx)?;
+                let idx = push_plain_node(arena, expr_any, pos, end, vec![child_idx]);
+                return Ok(Some(idx));
+            }
+        }
+        return Ok(None);
+    }
+
+    if let Ok(lookahead) = expr_any.cast::<Lookahead>() {
+        let look_ref = lookahead.borrow();
+        let members = look_ref.members.bind(py);
+        if members.len() == 0 {
+            return Ok(None);
+        }
+        let member0 = members.get_item(0)?;
+        let node = fast_match_core(py, &member0, text, pos, cache, error, arena)?;
+        let ok = (node.is_none()) == look_ref.negativity;
+        if ok {
+            let idx = push_plain_node(arena, expr_any, pos, pos, Vec::new());
+            return Ok(Some(idx));
+        }
+        return Ok(None);
+    }
+
+    if let Ok(q) = expr_any.cast::<Quantifier>() {
+        let q_ref = q.borrow();
+        let members = q_ref.members.bind(py);
+        if members.len() == 0 {
+            return Ok(None);
+        }
+        let member0 = members.get_item(0)?;
+        let mut new_pos = pos;
+        let mut children: Vec<usize> = Vec::new();
+
+        while new_pos < cache.len {
+            let under_max = match q_ref.max {
+                Some(max_value) => children.len() < max_value,
+                None => true,
+            };
+            if under_max == false {
+                break;
+            }
+            let node = fast_match_core(py, &member0, text, new_pos, cache, error, arena)?;
+            let Some(child_idx) = node else {
+                break;
+            };
+            let child_end = native_node_end(arena, child_idx)?;
+            let length = child_end.saturating_sub(new_pos);
+            children.push(child_idx);
+            if children.len() >= q_ref.min && length == 0 {
+                break;
+            }
+            new_pos = child_end;
+        }
+
+        if children.len() >= q_ref.min {
+            let idx = push_plain_node(arena, expr_any, pos, new_pos, children);
+            return Ok(Some(idx));
+        }
+        return Ok(None);
+    }
+
+    if expr_any.cast::<CustomExpr>().is_ok() {
+        return Err(PyRuntimeError::new_err(
+            "Custom expressions must use the compatibility matching path.",
+        ));
+    }
+
+    Err(PyRuntimeError::new_err(
+        "Unknown expression type; cannot match.",
+    ))
+}
+
 fn eq_expr(
     py: Python<'_>,
     a: &Bound<'_, PyAny>,
@@ -723,7 +1445,11 @@ impl Expression {
         tup.as_any().hash()
     }
 
-    fn __richcmp__(slf: PyRef<'_, Self>, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
         let py = other.py();
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
         let mut checked: HashSet<(usize, usize)> = HashSet::new();
@@ -759,17 +1485,125 @@ impl Expression {
         text: Py<PyAny>,
         pos: usize,
     ) -> PyResult<Py<PyAny>> {
-        let cache: Bound<'_, PackratCache> =
-            Bound::new(py, PackratCache::from_text(py, text.clone_ref(py))?)?;
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut visited: HashSet<usize> = HashSet::new();
+        let has_custom = contains_custom_expr(py, &self_any, &mut visited)?;
+
         let parse_error = parse_error_type(py)?;
         let error = parse_error.call1((text.bind(py),))?;
+        if has_custom {
+            let cache: Bound<'_, PackratCache> =
+                Bound::new(py, PackratCache::from_text(py, text.clone_ref(py))?)?;
+            let node = match_core_any(py, &self_any, text.bind(py), pos, &cache, &error)?;
+            let Some(node) = node else {
+                return Err(PyErr::from_value(error));
+            };
+            return Ok(node);
+        }
 
-        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
-        let node = match_core_any(py, &self_any, text.bind(py), pos, &cache, &error)?;
-        let Some(node) = node else {
+        let len = match text.bind(py).len() {
+            Ok(length) => length,
+            Err(_err) => {
+                return Err(PyTypeError::new_err(
+                    "Text must be str, bytes, or a sequence for TokenGrammar.",
+                ));
+            }
+        };
+        let mut cache = FastCache::new(len);
+        let mut arena: Vec<NativeNode> = Vec::new();
+        let node_idx = fast_match_core(
+            py,
+            &self_any,
+            text.bind(py),
+            pos,
+            &mut cache,
+            &error,
+            &mut arena,
+        )?;
+        let Some(node_idx) = node_idx else {
             return Err(PyErr::from_value(error));
         };
-        Ok(node)
+
+        let mut memo: HashMap<usize, Py<PyAny>> = HashMap::new();
+        materialize_native_node(py, text.bind(py), &arena, node_idx, &mut memo)
+    }
+
+    #[pyo3(signature = (text, pos=0))]
+    fn match_end(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        text: Py<PyAny>,
+        pos: usize,
+    ) -> PyResult<Option<usize>> {
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut visited: HashSet<usize> = HashSet::new();
+        let has_custom = contains_custom_expr(py, &self_any, &mut visited)?;
+
+        let parse_error = parse_error_type(py)?;
+        let error = parse_error.call1((text.bind(py),))?;
+        if has_custom {
+            let cache: Bound<'_, PackratCache> =
+                Bound::new(py, PackratCache::from_text(py, text.clone_ref(py))?)?;
+            let node = match_core_any(py, &self_any, text.bind(py), pos, &cache, &error)?;
+            let Some(node) = node else {
+                return Ok(None);
+            };
+            return Ok(Some(node_end(py, &node)?));
+        }
+
+        let len = match text.bind(py).len() {
+            Ok(length) => length,
+            Err(_err) => {
+                return Err(PyTypeError::new_err(
+                    "Text must be str, bytes, or a sequence for TokenGrammar.",
+                ));
+            }
+        };
+        let graph = compile_graph(py, &self_any)?;
+        let mut cache = CompiledCache::new(graph.nodes.len(), len);
+        let end = compiled_match_core(
+            py,
+            &graph,
+            graph.root,
+            text.bind(py),
+            pos,
+            &mut cache,
+            &error,
+        )?;
+        let Some(end) = end else {
+            return Ok(None);
+        };
+        Ok(Some(end))
+    }
+
+    #[pyo3(signature = (text, pos=0))]
+    fn parse_end(
+        slf: PyRef<'_, Self>,
+        py: Python<'_>,
+        text: Py<PyAny>,
+        pos: usize,
+    ) -> PyResult<usize> {
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let end = Expression::match_end(slf, py, text.clone_ref(py), pos)?;
+        let Some(end) = end else {
+            let parse_error = parse_error_type(py)?;
+            let error = parse_error.call1((text.bind(py), pos, self_any))?;
+            return Err(PyErr::from_value(error));
+        };
+
+        let size = match text.bind(py).len() {
+            Ok(length) => length,
+            Err(_err) => {
+                return Err(PyTypeError::new_err("Unsupported input type."));
+            }
+        };
+
+        if end < size {
+            let ty = incomplete_parse_error_type(py)?;
+            let inst = ty.call1((text.bind(py), end, self_any))?;
+            return Err(PyErr::from_value(inst));
+        }
+        Ok(end)
     }
 
     #[pyo3(signature = (text, pos, cache, error))]
