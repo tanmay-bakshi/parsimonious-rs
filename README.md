@@ -94,18 +94,18 @@ Sample output from this repository on CPython 3.14:
 
 | Case | Impl | API | Parse (s) | Throughput (KB/s) | Speedup vs upstream |
 |---|---:|---:|---:|---:|---:|
-| arithmetic | upstream-python | parse | 0.021281 | 537 | 1.00x |
-| arithmetic | parsimonious-rs | parse | 0.011210 | 1,019 | 1.90x |
-| arithmetic | parsimonious-rs | parse_end | 0.003119 | 3,663 | 6.82x |
-| json_like | upstream-python | parse | 0.016202 | 1,872 | 1.00x |
-| json_like | parsimonious-rs | parse | 0.008518 | 3,561 | 1.90x |
-| json_like | parsimonious-rs | parse_end | 0.002553 | 11,881 | 6.35x |
-| log_lines | upstream-python | parse | 0.006703 | 17,482 | 1.00x |
-| log_lines | parsimonious-rs | parse | 0.003513 | 33,362 | 1.91x |
-| log_lines | parsimonious-rs | parse_end | 0.001868 | 62,740 | 3.59x |
-| tiny_literal | upstream-python | parse | 0.000010 | 3,280 | 1.00x |
-| tiny_literal | parsimonious-rs | parse | 0.000005 | 5,958 | 1.82x |
-| tiny_literal | parsimonious-rs | parse_end | 0.000002 | 16,744 | 5.11x |
+| arithmetic | upstream-python | parse | 0.021786 | 524 | 1.00x |
+| arithmetic | parsimonious-rs | parse | 0.006181 | 1,848 | 3.52x |
+| arithmetic | parsimonious-rs | parse_end | 0.003223 | 3,544 | 6.76x |
+| json_like | upstream-python | parse | 0.016736 | 1,812 | 1.00x |
+| json_like | parsimonious-rs | parse | 0.004394 | 6,902 | 3.81x |
+| json_like | parsimonious-rs | parse_end | 0.002516 | 12,053 | 6.65x |
+| log_lines | upstream-python | parse | 0.006948 | 16,866 | 1.00x |
+| log_lines | parsimonious-rs | parse | 0.002841 | 41,246 | 2.45x |
+| log_lines | parsimonious-rs | parse_end | 0.001891 | 61,972 | 3.67x |
+| tiny_literal | upstream-python | parse | 0.000010 | 3,206 | 1.00x |
+| tiny_literal | parsimonious-rs | parse | 0.000003 | 8,956 | 2.79x |
+| tiny_literal | parsimonious-rs | parse_end | 0.000002 | 18,010 | 5.62x |
 
 Interpretation:
 

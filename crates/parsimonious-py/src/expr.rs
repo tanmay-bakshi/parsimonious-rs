@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
@@ -12,6 +14,7 @@ use crate::node::{Node, RegexNode};
 pub(crate) struct Expression {
     #[pyo3(get, set)]
     pub(crate) name: String,
+    match_plan_cache: Mutex<Option<MatchPlanCache>>,
 }
 
 #[pyclass(extends = Expression, subclass)]
@@ -34,19 +37,19 @@ pub(crate) struct Regex {
 
 #[pyclass(extends = Expression, subclass)]
 pub(crate) struct Sequence {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub(crate) members: Py<PyTuple>,
 }
 
 #[pyclass(extends = Expression, subclass)]
 pub(crate) struct OneOf {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub(crate) members: Py<PyTuple>,
 }
 
 #[pyclass(extends = Expression, subclass)]
 pub(crate) struct Lookahead {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub(crate) members: Py<PyTuple>,
     #[pyo3(get)]
     pub(crate) negativity: bool,
@@ -54,7 +57,7 @@ pub(crate) struct Lookahead {
 
 #[pyclass(extends = Expression, subclass)]
 pub(crate) struct Quantifier {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     pub(crate) members: Py<PyTuple>,
     #[pyo3(get)]
     pub(crate) min: usize,
@@ -120,6 +123,19 @@ struct CompiledGraph {
     root: usize,
     nodes: Vec<CompiledNode>,
 }
+
+#[derive(Clone)]
+enum MatchPlan {
+    HasCustom,
+    Compiled(Arc<CompiledGraph>),
+}
+
+struct MatchPlanCache {
+    generation: u64,
+    plan: MatchPlan,
+}
+
+static MATCH_PLAN_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 enum CompiledCacheSlot {
@@ -311,6 +327,22 @@ fn left_recursion_error_type(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         .into_any())
 }
 
+fn current_match_plan_generation() -> u64 {
+    MATCH_PLAN_GENERATION.load(Ordering::Relaxed)
+}
+
+fn invalidate_match_plans() {
+    let _ = MATCH_PLAN_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+fn lock_match_plan_cache<'a>(
+    cache: &'a Mutex<Option<MatchPlanCache>>,
+) -> PyResult<std::sync::MutexGuard<'a, Option<MatchPlanCache>>> {
+    cache
+        .lock()
+        .map_err(|_err| PyRuntimeError::new_err("Expression match plan cache lock was poisoned."))
+}
+
 fn update_error(
     _py: Python<'_>,
     expr_any: &Bound<'_, PyAny>,
@@ -395,6 +427,41 @@ fn contains_custom_expr(
     Ok(false)
 }
 
+fn compute_match_plan(py: Python<'_>, expr_any: &Bound<'_, PyAny>) -> PyResult<MatchPlan> {
+    let mut visited: HashSet<usize> = HashSet::new();
+    let has_custom = contains_custom_expr(py, expr_any, &mut visited)?;
+    if has_custom {
+        return Ok(MatchPlan::HasCustom);
+    }
+    Ok(MatchPlan::Compiled(Arc::new(compile_graph(py, expr_any)?)))
+}
+
+fn get_match_plan(
+    py: Python<'_>,
+    slf: &PyRef<'_, Expression>,
+    expr_any: &Bound<'_, PyAny>,
+) -> PyResult<MatchPlan> {
+    let generation = current_match_plan_generation();
+    {
+        let guard = lock_match_plan_cache(&slf.match_plan_cache)?;
+        if let Some(cached) = guard.as_ref() {
+            if cached.generation == generation {
+                return Ok(cached.plan.clone());
+            }
+        }
+    }
+
+    let plan = compute_match_plan(py, expr_any)?;
+    {
+        let mut guard = lock_match_plan_cache(&slf.match_plan_cache)?;
+        *guard = Some(MatchPlanCache {
+            generation,
+            plan: plan.clone(),
+        });
+    }
+    Ok(plan)
+}
+
 fn push_plain_node(
     arena: &mut Vec<NativeNode>,
     expr: &Bound<'_, PyAny>,
@@ -444,9 +511,14 @@ fn materialize_native_node(
     text: &Bound<'_, PyAny>,
     arena: &[NativeNode],
     idx: usize,
-    memo: &mut HashMap<usize, Py<PyAny>>,
+    memo: &mut [Option<Py<PyAny>>],
 ) -> PyResult<Py<PyAny>> {
-    if let Some(existing) = memo.get(&idx) {
+    if idx >= memo.len() {
+        return Err(PyRuntimeError::new_err(
+            "Native parse node index out of bounds.",
+        ));
+    }
+    if let Some(existing) = memo[idx].as_ref() {
         return Ok(existing.clone_ref(py));
     }
 
@@ -484,7 +556,7 @@ fn materialize_native_node(
         }
     };
 
-    memo.insert(idx, py_node.clone_ref(py));
+    memo[idx] = Some(py_node.clone_ref(py));
     Ok(py_node)
 }
 
@@ -1418,6 +1490,7 @@ impl Expression {
     fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         }
     }
 
@@ -1470,12 +1543,11 @@ impl Expression {
         pos: usize,
     ) -> PyResult<Py<PyAny>> {
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
-        let mut visited: HashSet<usize> = HashSet::new();
-        let has_custom = contains_custom_expr(py, &self_any, &mut visited)?;
+        let plan = get_match_plan(py, &slf, &self_any)?;
 
-        let parse_error = parse_error_type(py)?;
-        let error = parse_error.call1((text.bind(py),))?;
-        if has_custom {
+        if let MatchPlan::HasCustom = plan {
+            let parse_error = parse_error_type(py)?;
+            let error = parse_error.call1((text.bind(py),))?;
             let cache: Bound<'_, PackratCache> =
                 Bound::new(py, PackratCache::from_text(py, text.clone_ref(py))?)?;
             let node = match_core_any(py, &self_any, text.bind(py), pos, &cache, &error)?;
@@ -1493,24 +1565,44 @@ impl Expression {
                 ));
             }
         };
-        let graph = compile_graph(py, &self_any)?;
+        let graph = match plan {
+            MatchPlan::Compiled(graph) => graph,
+            MatchPlan::HasCustom => {
+                return Err(PyRuntimeError::new_err(
+                    "Internal match plan mismatch for compiled matcher path.",
+                ));
+            }
+        };
         let mut cache = CompiledTreeCache::new(graph.nodes.len(), len);
         let mut arena: Vec<NativeNode> = Vec::new();
         let node_idx = compiled_match_core_tree(
             py,
-            &graph,
+            graph.as_ref(),
             graph.root,
             text.bind(py),
             pos,
             &mut cache,
-            Some(&error),
+            None,
             &mut arena,
         )?;
         let Some(node_idx) = node_idx else {
+            let parse_error = parse_error_type(py)?;
+            let error = parse_error.call1((text.bind(py),))?;
+            let mut error_cache = CompiledCache::new(graph.nodes.len(), len);
+            let _ = compiled_match_core(
+                py,
+                graph.as_ref(),
+                graph.root,
+                text.bind(py),
+                pos,
+                &mut error_cache,
+                Some(&error),
+            )?;
             return Err(PyErr::from_value(error));
         };
 
-        let mut memo: HashMap<usize, Py<PyAny>> = HashMap::new();
+        let mut memo: Vec<Option<Py<PyAny>>> =
+            std::iter::repeat_with(|| None).take(arena.len()).collect();
         materialize_native_node(py, text.bind(py), &arena, node_idx, &mut memo)
     }
 
@@ -1522,10 +1614,9 @@ impl Expression {
         pos: usize,
     ) -> PyResult<Option<usize>> {
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
-        let mut visited: HashSet<usize> = HashSet::new();
-        let has_custom = contains_custom_expr(py, &self_any, &mut visited)?;
+        let plan = get_match_plan(py, &slf, &self_any)?;
 
-        if has_custom {
+        if let MatchPlan::HasCustom = plan {
             let parse_error = parse_error_type(py)?;
             let error = parse_error.call1((text.bind(py),))?;
             let cache: Bound<'_, PackratCache> =
@@ -1545,10 +1636,24 @@ impl Expression {
                 ));
             }
         };
-        let graph = compile_graph(py, &self_any)?;
+        let graph = match plan {
+            MatchPlan::Compiled(graph) => graph,
+            MatchPlan::HasCustom => {
+                return Err(PyRuntimeError::new_err(
+                    "Internal match plan mismatch for compiled matcher path.",
+                ));
+            }
+        };
         let mut cache = CompiledCache::new(graph.nodes.len(), len);
-        let end =
-            compiled_match_core(py, &graph, graph.root, text.bind(py), pos, &mut cache, None)?;
+        let end = compiled_match_core(
+            py,
+            graph.as_ref(),
+            graph.root,
+            text.bind(py),
+            pos,
+            &mut cache,
+            None,
+        )?;
         let Some(end) = end else {
             return Ok(None);
         };
@@ -1655,7 +1760,10 @@ impl Expression {
             .and_then(|v| v.extract::<String>())
             .unwrap_or_else(|_err| "<callable>".to_string());
 
-        let base = Expression { name: rule_name };
+        let base = Expression {
+            name: rule_name,
+            match_plan_cache: Mutex::new(None),
+        };
         let init = PyClassInitializer::from(base).add_subclass(CustomExpr {
             callable,
             arity,
@@ -1674,6 +1782,7 @@ impl Literal {
     fn new(_py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         Ok(PyClassInitializer::from(base).add_subclass(Self { literal }))
     }
@@ -1712,6 +1821,7 @@ impl TokenMatcher {
     fn new(_py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         Ok(PyClassInitializer::from(base).add_subclass(Self { literal }))
     }
@@ -1789,6 +1899,7 @@ impl Regex {
 
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         Ok(PyClassInitializer::from(base).add_subclass(Self {
             re: compiled.unbind(),
@@ -1833,6 +1944,7 @@ impl Sequence {
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         Ok(PyClassInitializer::from(base).add_subclass(Self {
             members: members.unbind(),
@@ -1865,6 +1977,12 @@ impl Sequence {
         }
     }
 
+    #[setter]
+    fn set_members(&mut self, members: Py<PyTuple>) {
+        self.members = members;
+        invalidate_match_plans();
+    }
+
     fn resolve_refs(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -1882,6 +2000,7 @@ impl Sequence {
         }
         let new_tuple = PyTuple::new(py, new_members)?;
         slf.members = new_tuple.unbind();
+        invalidate_match_plans();
 
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
         Ok(self_any.unbind())
@@ -1899,6 +2018,7 @@ impl OneOf {
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         Ok(PyClassInitializer::from(base).add_subclass(Self {
             members: members.unbind(),
@@ -1930,6 +2050,12 @@ impl OneOf {
         }
     }
 
+    #[setter]
+    fn set_members(&mut self, members: Py<PyTuple>) {
+        self.members = members;
+        invalidate_match_plans();
+    }
+
     fn resolve_refs(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -1947,6 +2073,7 @@ impl OneOf {
         }
         let new_tuple = PyTuple::new(py, new_members)?;
         slf.members = new_tuple.unbind();
+        invalidate_match_plans();
 
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
         Ok(self_any.unbind())
@@ -1965,6 +2092,7 @@ impl Lookahead {
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
         let members = PyTuple::new(py, [member])?;
         Ok(PyClassInitializer::from(base).add_subclass(Self {
@@ -1998,6 +2126,12 @@ impl Lookahead {
         }
     }
 
+    #[setter]
+    fn set_members(&mut self, members: Py<PyTuple>) {
+        self.members = members;
+        invalidate_match_plans();
+    }
+
     fn resolve_refs(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -2015,6 +2149,7 @@ impl Lookahead {
         }
         let new_tuple = PyTuple::new(py, new_members)?;
         slf.members = new_tuple.unbind();
+        invalidate_match_plans();
 
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
         Ok(self_any.unbind())
@@ -2034,6 +2169,7 @@ impl Quantifier {
     ) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
+            match_plan_cache: Mutex::new(None),
         };
 
         let members = match member {
@@ -2099,6 +2235,12 @@ impl Quantifier {
         }
     }
 
+    #[setter]
+    fn set_members(&mut self, members: Py<PyTuple>) {
+        self.members = members;
+        invalidate_match_plans();
+    }
+
     fn resolve_refs(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -2116,6 +2258,7 @@ impl Quantifier {
         }
         let new_tuple = PyTuple::new(py, new_members)?;
         slf.members = new_tuple.unbind();
+        invalidate_match_plans();
 
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
         Ok(self_any.unbind())
