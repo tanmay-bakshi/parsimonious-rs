@@ -8,4 +8,3 @@
 pub fn placeholder() -> &'static str {
     "parsimonious core crate (WIP)"
 }
-

@@ -10,7 +10,3 @@ thiserror = "2.0.12"
 
 [dev-dependencies]
 criterion = "0.5.1"
-
-[[bench]]
-name = "json_like"
-harness = false
