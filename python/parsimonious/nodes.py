@@ -1,7 +1,5 @@
 """Parse tree nodes and visitor utilities."""
 
-from __future__ import annotations
-
 from inspect import isfunction
 from typing import Any, Callable, ClassVar
 
@@ -126,4 +124,3 @@ class NodeVisitor(metaclass=RuleDecoratorMeta):
             )
         node = getattr(self.grammar, method_name)(text, pos=pos)
         return self.visit(node)
-

@@ -695,6 +695,12 @@ fn eq_expr(
         return Ok(callables_eq && grammars_eq);
     }
 
+    if let Ok(_ea) = a.cast::<Expression>() {
+        let na: String = a.getattr("name")?.extract()?;
+        let nb: String = b.getattr("name")?.extract()?;
+        return Ok(na == nb);
+    }
+
     // Fall back to object identity when unsure.
     Ok(a.as_ptr() == b.as_ptr())
 }
@@ -717,25 +723,15 @@ impl Expression {
         tup.as_any().hash()
     }
 
-    fn __richcmp__(
-        slf: PyRef<'_, Self>,
-        py: Python<'_>,
-        other: &Bound<'_, PyAny>,
-        op: CompareOp,
-    ) -> PyResult<Py<PyAny>> {
+    fn __richcmp__(slf: PyRef<'_, Self>, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<Py<PyAny>> {
+        let py = other.py();
         let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
 
         match op {
-            CompareOp::Eq => {
-                let mut checked: HashSet<(usize, usize)> = HashSet::new();
-                let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
-                Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind())
-            }
-            CompareOp::Ne => {
-                let mut checked: HashSet<(usize, usize)> = HashSet::new();
-                let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
-                Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind())
-            }
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
             _ => Ok(py.NotImplemented()),
         }
     }
@@ -862,7 +858,7 @@ impl Expression {
 impl Literal {
     #[new]
     #[pyo3(signature = (literal, name=""))]
-    fn new(py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
+    fn new(_py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
         };
@@ -877,13 +873,30 @@ impl Literal {
         let tup = PyTuple::new(py, [name.into_pyobject(py)?.into_any(), literal])?;
         tup.as_any().hash()
     }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
+    }
 }
 
 #[pymethods]
 impl TokenMatcher {
     #[new]
     #[pyo3(signature = (literal, name=""))]
-    fn new(py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
+    fn new(_py: Python<'_>, literal: Py<PyAny>, name: &str) -> PyResult<PyClassInitializer<Self>> {
         let base = Expression {
             name: name.to_string(),
         };
@@ -897,6 +910,23 @@ impl TokenMatcher {
         let literal = self_any.getattr("literal")?;
         let tup = PyTuple::new(py, [name.into_pyobject(py)?.into_any(), literal])?;
         tup.as_any().hash()
+    }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
     }
 }
 
@@ -960,6 +990,23 @@ impl Regex {
         let tup = PyTuple::new(py, [name.into_pyobject(py)?.into_any(), re_obj])?;
         tup.as_any().hash()
     }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
+    }
 }
 
 #[pymethods]
@@ -967,7 +1014,7 @@ impl Sequence {
     #[new]
     #[pyo3(signature = (*members, name=""))]
     fn new(
-        py: Python<'_>,
+        _py: Python<'_>,
         members: Bound<'_, PyTuple>,
         name: &str,
     ) -> PyResult<PyClassInitializer<Self>> {
@@ -986,6 +1033,23 @@ impl Sequence {
         let name: String = self_any.getattr("name")?.extract()?;
         let tup = PyTuple::new(py, [ty.into_any(), name.into_pyobject(py)?.into_any()])?;
         tup.as_any().hash()
+    }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
     }
 
     fn resolve_refs(
@@ -1016,7 +1080,7 @@ impl OneOf {
     #[new]
     #[pyo3(signature = (*members, name=""))]
     fn new(
-        py: Python<'_>,
+        _py: Python<'_>,
         members: Bound<'_, PyTuple>,
         name: &str,
     ) -> PyResult<PyClassInitializer<Self>> {
@@ -1034,6 +1098,23 @@ impl OneOf {
         let name: String = self_any.getattr("name")?.extract()?;
         let tup = PyTuple::new(py, [ty.into_any(), name.into_pyobject(py)?.into_any()])?;
         tup.as_any().hash()
+    }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
     }
 
     fn resolve_refs(
@@ -1087,6 +1168,23 @@ impl Lookahead {
         tup.as_any().hash()
     }
 
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
+    }
+
     fn resolve_refs(
         mut slf: PyRefMut<'_, Self>,
         py: Python<'_>,
@@ -1134,14 +1232,16 @@ impl Quantifier {
             None => None,
             Some(m) => {
                 let m_any = m.bind(py);
-                if let Ok(f) = m_any.extract::<f64>() {
+                if let Ok(u) = m_any.extract::<usize>() {
+                    Some(u)
+                } else if let Ok(f) = m_any.extract::<f64>() {
                     if f.is_infinite() && f.is_sign_positive() {
                         None
                     } else {
                         return Err(PyTypeError::new_err("max must be an int or infinity."));
                     }
                 } else {
-                    Some(m_any.extract::<usize>()?)
+                    return Err(PyTypeError::new_err("max must be an int or infinity."));
                 }
             }
         };
@@ -1167,6 +1267,23 @@ impl Quantifier {
         let name: String = self_any.getattr("name")?.extract()?;
         let tup = PyTuple::new(py, [ty.into_any(), name.into_pyobject(py)?.into_any()])?;
         tup.as_any().hash()
+    }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
     }
 
     fn resolve_refs(
@@ -1199,5 +1316,22 @@ impl CustomExpr {
         let name: String = self_any.getattr("name")?.extract()?;
         let tup = PyTuple::new(py, [name])?;
         tup.as_any().hash()
+    }
+
+    fn __richcmp__(
+        slf: PyRef<'_, Self>,
+        other: &Bound<'_, PyAny>,
+        op: CompareOp,
+    ) -> PyResult<Py<PyAny>> {
+        let py = other.py();
+        let self_any: Bound<'_, PyAny> = unsafe { Bound::from_borrowed_ptr(py, slf.as_ptr()) };
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        let eq = eq_expr(py, &self_any, other, &mut checked).unwrap_or(false);
+
+        match op {
+            CompareOp::Eq => Ok(eq.into_pyobject(py)?.to_owned().into_any().unbind()),
+            CompareOp::Ne => Ok((!eq).into_pyobject(py)?.to_owned().into_any().unbind()),
+            _ => Ok(py.NotImplemented()),
+        }
     }
 }

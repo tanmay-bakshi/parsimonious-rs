@@ -11,7 +11,6 @@ pub(crate) enum CacheSlot {
 
 #[pyclass]
 pub(crate) struct PackratCache {
-    pub(crate) text: Py<PyAny>,
     pub(crate) len: usize,
     pub(crate) per_expr: HashMap<usize, Vec<CacheSlot>>,
 }
@@ -37,7 +36,6 @@ impl PackratCache {
         };
 
         Ok(Self {
-            text,
             len,
             per_expr: HashMap::new(),
         })

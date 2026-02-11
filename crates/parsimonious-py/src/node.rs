@@ -143,7 +143,7 @@ impl Node {
             }
 
             let expr_repr = expr.repr()?.to_str()?.to_string();
-            let children_list: &Bound<'_, PyList> = children.downcast::<PyList>()?;
+            let children_list: &Bound<'_, PyList> = children.cast::<PyList>()?;
             if children_list.len() == 0 {
                 lines.push(format!("{class_name}({expr_repr}, s, {start}, {end})"));
                 return Ok(lines.join("\n"));

@@ -4,8 +4,6 @@ This module mirrors the original ``parsimonious.utils`` API.
 
 """
 
-from __future__ import annotations
-
 import ast
 from dataclasses import dataclass
 
@@ -27,7 +25,7 @@ def evaluate_string(string: str) -> str | bytes:
     return ast.literal_eval(string)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class Token(StrAndRepr):
     """A token for ``TokenGrammar`` inputs.
 
@@ -40,4 +38,3 @@ class Token(StrAndRepr):
 
     def __str__(self) -> str:
         return '<Token "%s">' % (self.type,)
-

@@ -4,8 +4,6 @@ These utilities are intentionally not part of the public API.
 
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 
@@ -25,4 +23,3 @@ class _DummyNode:
 
 
 DUMMY_NODE: _DummyNode = _DummyNode()
-

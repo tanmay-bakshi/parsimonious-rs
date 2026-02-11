@@ -4,8 +4,6 @@ The core expression engine is implemented in Rust and re-exported here.
 
 """
 
-from __future__ import annotations
-
 from inspect import getfullargspec, isfunction, ismethod, ismethoddescriptor
 from typing import Any
 
@@ -64,3 +62,46 @@ def expression(callable: Any, rule_name: str, grammar: Any) -> Expression:
 
     return Expression.custom(rule_name, callable, arity, grammar)
 
+
+def Not(term: Any) -> Lookahead:
+    """Return a negative lookahead for an expression.
+
+    :param term: The expression to negate.
+    :returns: A negative lookahead expression.
+    """
+
+    return Lookahead(term, negative=True)
+
+
+def ZeroOrMore(member: Any, name: str = "") -> Quantifier:
+    """Return a ``*``-style quantifier.
+
+    :param member: The quantified expression.
+    :param name: Optional expression name.
+    :returns: A quantifier expression.
+    """
+
+    return Quantifier(member, name=name, min=0, max=float("inf"))
+
+
+def OneOrMore(member: Any, name: str = "", min: int = 1) -> Quantifier:
+    """Return a ``+``-style quantifier.
+
+    :param member: The quantified expression.
+    :param name: Optional expression name.
+    :param min: Minimum repetitions (default 1).
+    :returns: A quantifier expression.
+    """
+
+    return Quantifier(member, name=name, min=min, max=float("inf"))
+
+
+def Optional(member: Any, name: str = "") -> Quantifier:
+    """Return a ``?``-style quantifier.
+
+    :param member: The optional expression.
+    :param name: Optional expression name.
+    :returns: A quantifier expression.
+    """
+
+    return Quantifier(member, name=name, min=0, max=1)
