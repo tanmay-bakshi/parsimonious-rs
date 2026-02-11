@@ -94,15 +94,15 @@ Sample output from this repository on CPython 3.14:
 
 | Case | Impl | API | Parse (s) | Throughput (KB/s) | Speedup vs upstream |
 |---|---:|---:|---:|---:|---:|
-| arithmetic | upstream-python | parse | 0.021295 | 536 | 1.00x |
-| arithmetic | parsimonious-rs | parse | 0.012912 | 885 | 1.65x |
-| arithmetic | parsimonious-rs | parse_end | 0.006724 | 1,699 | 3.17x |
-| json_like | upstream-python | parse | 0.016373 | 1,852 | 1.00x |
-| json_like | parsimonious-rs | parse | 0.009412 | 3,222 | 1.74x |
-| json_like | parsimonious-rs | parse_end | 0.005833 | 5,199 | 2.81x |
-| log_lines | upstream-python | parse | 0.006745 | 17,374 | 1.00x |
-| log_lines | parsimonious-rs | parse | 0.003913 | 29,948 | 1.72x |
-| log_lines | parsimonious-rs | parse_end | 0.001895 | 61,843 | 3.56x |
+| arithmetic | upstream-python | parse | 0.020771 | 550 | 1.00x |
+| arithmetic | parsimonious-rs | parse | 0.012639 | 904 | 1.64x |
+| arithmetic | parsimonious-rs | parse_end | 0.006759 | 1,690 | 3.07x |
+| json_like | upstream-python | parse | 0.015951 | 1,901 | 1.00x |
+| json_like | parsimonious-rs | parse | 0.008873 | 3,418 | 1.80x |
+| json_like | parsimonious-rs | parse_end | 0.005726 | 5,296 | 2.79x |
+| log_lines | upstream-python | parse | 0.006577 | 17,817 | 1.00x |
+| log_lines | parsimonious-rs | parse | 0.004233 | 27,684 | 1.55x |
+| log_lines | parsimonious-rs | parse_end | 0.001824 | 64,239 | 3.61x |
 
 Interpretation:
 

@@ -84,35 +84,6 @@ enum NativeNode {
     },
 }
 
-#[derive(Clone, Copy)]
-enum FastCacheSlot {
-    Unknown,
-    InProgress,
-    Done(Option<usize>),
-}
-
-struct FastCache {
-    len: usize,
-    per_expr: HashMap<usize, Vec<FastCacheSlot>>,
-}
-
-impl FastCache {
-    fn new(len: usize) -> Self {
-        Self {
-            len,
-            per_expr: HashMap::new(),
-        }
-    }
-
-    fn slots_for_expr_mut(&mut self, expr_id: usize) -> &mut Vec<FastCacheSlot> {
-        self.per_expr.entry(expr_id).or_insert_with(|| {
-            let mut slots: Vec<FastCacheSlot> = Vec::with_capacity(self.len + 1);
-            slots.resize_with(self.len + 1, || FastCacheSlot::Unknown);
-            slots
-        })
-    }
-}
-
 enum CompiledKind {
     TokenMatcher {
         literal: Py<PyAny>,
@@ -767,6 +738,154 @@ fn compiled_uncached_match(
     }
 }
 
+fn compiled_build_tree(
+    py: Python<'_>,
+    graph: &CompiledGraph,
+    node_idx: usize,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut CompiledCache,
+    error: &Bound<'_, PyAny>,
+    arena: &mut Vec<NativeNode>,
+) -> PyResult<Option<usize>> {
+    let end = compiled_match_core(py, graph, node_idx, text, pos, cache, error)?;
+    let Some(end) = end else {
+        return Ok(None);
+    };
+
+    let node = &graph.nodes[node_idx];
+    match &node.kind {
+        CompiledKind::TokenMatcher { .. } | CompiledKind::Literal { .. } => {
+            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, Vec::new());
+            Ok(Some(idx))
+        }
+        CompiledKind::Regex { re } => {
+            let re_any = re.bind(py);
+            let m = re_any.call_method1("match", (text, pos))?;
+            if m.is_none() {
+                return Err(PyRuntimeError::new_err(
+                    "Compiled tree builder expected regex match but got None.",
+                ));
+            }
+            let idx = push_regex_node(arena, node.expr.bind(py), pos, end, m.unbind());
+            Ok(Some(idx))
+        }
+        CompiledKind::Sequence { members } => {
+            let mut new_pos = pos;
+            let mut children: Vec<usize> = Vec::with_capacity(members.len());
+            for member_idx in members {
+                let child = compiled_build_tree(
+                    py,
+                    graph,
+                    *member_idx,
+                    text,
+                    new_pos,
+                    cache,
+                    error,
+                    arena,
+                )?;
+                let Some(child) = child else {
+                    return Err(PyRuntimeError::new_err(
+                        "Compiled tree builder sequence child unexpectedly failed.",
+                    ));
+                };
+                new_pos = native_node_end(arena, child)?;
+                children.push(child);
+            }
+            if new_pos != end {
+                return Err(PyRuntimeError::new_err(
+                    "Compiled tree builder sequence end mismatch.",
+                ));
+            }
+            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, children);
+            Ok(Some(idx))
+        }
+        CompiledKind::OneOf { members } => {
+            for member_idx in members {
+                let child_end =
+                    compiled_match_core(py, graph, *member_idx, text, pos, cache, error)?;
+                if child_end.is_some() {
+                    let child = compiled_build_tree(
+                        py,
+                        graph,
+                        *member_idx,
+                        text,
+                        pos,
+                        cache,
+                        error,
+                        arena,
+                    )?;
+                    let Some(child) = child else {
+                        return Err(PyRuntimeError::new_err(
+                            "Compiled tree builder one-of child unexpectedly failed.",
+                        ));
+                    };
+                    let child_end = native_node_end(arena, child)?;
+                    if child_end != end {
+                        return Err(PyRuntimeError::new_err(
+                            "Compiled tree builder one-of end mismatch.",
+                        ));
+                    }
+                    let idx = push_plain_node(arena, node.expr.bind(py), pos, end, vec![child]);
+                    return Ok(Some(idx));
+                }
+            }
+            Err(PyRuntimeError::new_err(
+                "Compiled tree builder could not choose one-of member.",
+            ))
+        }
+        CompiledKind::Lookahead { .. } => {
+            let idx = push_plain_node(arena, node.expr.bind(py), pos, pos, Vec::new());
+            Ok(Some(idx))
+        }
+        CompiledKind::Quantifier { member, min, max } => {
+            let mut new_pos = pos;
+            let mut children: Vec<usize> = Vec::new();
+            while new_pos < cache.len {
+                let under_max = match max {
+                    Some(max_value) => children.len() < *max_value,
+                    None => true,
+                };
+                if under_max == false {
+                    break;
+                }
+
+                let child_end =
+                    compiled_match_core(py, graph, *member, text, new_pos, cache, error)?;
+                let Some(child_end) = child_end else {
+                    break;
+                };
+                let child =
+                    compiled_build_tree(py, graph, *member, text, new_pos, cache, error, arena)?;
+                let Some(child) = child else {
+                    return Err(PyRuntimeError::new_err(
+                        "Compiled tree builder quantifier child unexpectedly failed.",
+                    ));
+                };
+                let length = child_end.saturating_sub(new_pos);
+                children.push(child);
+                if children.len() >= *min && length == 0 {
+                    break;
+                }
+                new_pos = child_end;
+            }
+
+            if children.len() < *min {
+                return Err(PyRuntimeError::new_err(
+                    "Compiled tree builder quantifier minimum mismatch.",
+                ));
+            }
+            if new_pos != end {
+                return Err(PyRuntimeError::new_err(
+                    "Compiled tree builder quantifier end mismatch.",
+                ));
+            }
+            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, children);
+            Ok(Some(idx))
+        }
+    }
+}
+
 fn new_node(
     py: Python<'_>,
     expr: &Bound<'_, PyAny>,
@@ -1056,199 +1175,6 @@ fn uncached_match(
     }
 }
 
-fn fast_match_core(
-    py: Python<'_>,
-    expr_any: &Bound<'_, PyAny>,
-    text: &Bound<'_, PyAny>,
-    pos: usize,
-    cache: &mut FastCache,
-    error: &Bound<'_, PyAny>,
-    arena: &mut Vec<NativeNode>,
-) -> PyResult<Option<usize>> {
-    let expr_id: usize = expr_any.as_ptr() as usize;
-    if pos > cache.len {
-        return Ok(None);
-    }
-
-    {
-        let slots = cache.slots_for_expr_mut(expr_id);
-        match slots[pos] {
-            FastCacheSlot::Unknown => {
-                slots[pos] = FastCacheSlot::InProgress;
-            }
-            FastCacheSlot::InProgress => {
-                let ty = left_recursion_error_type(py)?;
-                let inst = ty.call1((text, -1isize, expr_any))?;
-                return Err(PyErr::from_value(inst));
-            }
-            FastCacheSlot::Done(node_idx) => {
-                return Ok(node_idx);
-            }
-        }
-    }
-
-    let result = fast_uncached_match(py, expr_any, text, pos, cache, error, arena)?;
-
-    {
-        let slots = cache.slots_for_expr_mut(expr_id);
-        slots[pos] = FastCacheSlot::Done(result);
-    }
-
-    if result.is_none() {
-        update_error(py, expr_any, pos, error)?;
-    }
-
-    Ok(result)
-}
-
-fn fast_uncached_match(
-    py: Python<'_>,
-    expr_any: &Bound<'_, PyAny>,
-    text: &Bound<'_, PyAny>,
-    pos: usize,
-    cache: &mut FastCache,
-    error: &Bound<'_, PyAny>,
-    arena: &mut Vec<NativeNode>,
-) -> PyResult<Option<usize>> {
-    if let Ok(tok) = expr_any.cast::<TokenMatcher>() {
-        if pos >= cache.len {
-            return Ok(None);
-        }
-        let tok_ref = tok.borrow();
-        let item = text.get_item(pos)?;
-        let ty = item.getattr("type")?;
-        let ok: bool = ty.eq(tok_ref.literal.bind(py))?;
-        if ok {
-            let end = pos + 1;
-            let idx = push_plain_node(arena, expr_any, pos, end, Vec::new());
-            return Ok(Some(idx));
-        }
-        return Ok(None);
-    }
-
-    if let Ok(lit) = expr_any.cast::<Literal>() {
-        let lit_ref = lit.borrow();
-        let literal = lit_ref.literal.bind(py);
-        let ok: bool = text.call_method1("startswith", (literal, pos))?.extract()?;
-        if ok {
-            let lit_len = literal.len()?;
-            let end = pos + lit_len;
-            let idx = push_plain_node(arena, expr_any, pos, end, Vec::new());
-            return Ok(Some(idx));
-        }
-        return Ok(None);
-    }
-
-    if let Ok(regex) = expr_any.cast::<Regex>() {
-        let regex_ref = regex.borrow();
-        let re_any = regex_ref.re.bind(py);
-        let m = re_any.call_method1("match", (text, pos))?;
-        if m.is_none() {
-            return Ok(None);
-        }
-        let end: usize = m.call_method0("end")?.extract()?;
-        let idx = push_regex_node(arena, expr_any, pos, end, m.unbind());
-        return Ok(Some(idx));
-    }
-
-    if let Ok(seq) = expr_any.cast::<Sequence>() {
-        let seq_ref = seq.borrow();
-        let members = seq_ref.members.bind(py);
-        let mut new_pos = pos;
-        let mut children: Vec<usize> = Vec::with_capacity(members.len());
-
-        for member in members.iter() {
-            let node = fast_match_core(py, &member, text, new_pos, cache, error, arena)?;
-            let Some(child_idx) = node else {
-                return Ok(None);
-            };
-            new_pos = native_node_end(arena, child_idx)?;
-            children.push(child_idx);
-        }
-
-        let idx = push_plain_node(arena, expr_any, pos, new_pos, children);
-        return Ok(Some(idx));
-    }
-
-    if let Ok(oneof) = expr_any.cast::<OneOf>() {
-        let oneof_ref = oneof.borrow();
-        let members = oneof_ref.members.bind(py);
-        for member in members.iter() {
-            let node = fast_match_core(py, &member, text, pos, cache, error, arena)?;
-            if let Some(child_idx) = node {
-                let end = native_node_end(arena, child_idx)?;
-                let idx = push_plain_node(arena, expr_any, pos, end, vec![child_idx]);
-                return Ok(Some(idx));
-            }
-        }
-        return Ok(None);
-    }
-
-    if let Ok(lookahead) = expr_any.cast::<Lookahead>() {
-        let look_ref = lookahead.borrow();
-        let members = look_ref.members.bind(py);
-        if members.len() == 0 {
-            return Ok(None);
-        }
-        let member0 = members.get_item(0)?;
-        let node = fast_match_core(py, &member0, text, pos, cache, error, arena)?;
-        let ok = (node.is_none()) == look_ref.negativity;
-        if ok {
-            let idx = push_plain_node(arena, expr_any, pos, pos, Vec::new());
-            return Ok(Some(idx));
-        }
-        return Ok(None);
-    }
-
-    if let Ok(q) = expr_any.cast::<Quantifier>() {
-        let q_ref = q.borrow();
-        let members = q_ref.members.bind(py);
-        if members.len() == 0 {
-            return Ok(None);
-        }
-        let member0 = members.get_item(0)?;
-        let mut new_pos = pos;
-        let mut children: Vec<usize> = Vec::new();
-
-        while new_pos < cache.len {
-            let under_max = match q_ref.max {
-                Some(max_value) => children.len() < max_value,
-                None => true,
-            };
-            if under_max == false {
-                break;
-            }
-            let node = fast_match_core(py, &member0, text, new_pos, cache, error, arena)?;
-            let Some(child_idx) = node else {
-                break;
-            };
-            let child_end = native_node_end(arena, child_idx)?;
-            let length = child_end.saturating_sub(new_pos);
-            children.push(child_idx);
-            if children.len() >= q_ref.min && length == 0 {
-                break;
-            }
-            new_pos = child_end;
-        }
-
-        if children.len() >= q_ref.min {
-            let idx = push_plain_node(arena, expr_any, pos, new_pos, children);
-            return Ok(Some(idx));
-        }
-        return Ok(None);
-    }
-
-    if expr_any.cast::<CustomExpr>().is_ok() {
-        return Err(PyRuntimeError::new_err(
-            "Custom expressions must use the compatibility matching path.",
-        ));
-    }
-
-    Err(PyRuntimeError::new_err(
-        "Unknown expression type; cannot match.",
-    ))
-}
-
 fn eq_expr(
     py: Python<'_>,
     a: &Bound<'_, PyAny>,
@@ -1509,11 +1435,13 @@ impl Expression {
                 ));
             }
         };
-        let mut cache = FastCache::new(len);
+        let graph = compile_graph(py, &self_any)?;
+        let mut cache = CompiledCache::new(graph.nodes.len(), len);
         let mut arena: Vec<NativeNode> = Vec::new();
-        let node_idx = fast_match_core(
+        let node_idx = compiled_build_tree(
             py,
-            &self_any,
+            &graph,
+            graph.root,
             text.bind(py),
             pos,
             &mut cache,
