@@ -143,6 +143,28 @@ impl CompiledCache {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CompiledTreeCacheSlot {
+    Unknown,
+    InProgress,
+    Done(Option<usize>),
+}
+
+struct CompiledTreeCache {
+    len: usize,
+    per_node: Vec<Vec<CompiledTreeCacheSlot>>,
+}
+
+impl CompiledTreeCache {
+    fn new(node_count: usize, len: usize) -> Self {
+        let row = vec![CompiledTreeCacheSlot::Unknown; len + 1];
+        Self {
+            len,
+            per_node: vec![row; node_count],
+        }
+    }
+}
+
 fn py_repr(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(obj.repr()?.to_str()?.to_string())
 }
@@ -596,7 +618,7 @@ fn compiled_match_core(
     text: &Bound<'_, PyAny>,
     pos: usize,
     cache: &mut CompiledCache,
-    error: &Bound<'_, PyAny>,
+    error: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Option<usize>> {
     if pos > cache.len {
         return Ok(None);
@@ -626,8 +648,10 @@ fn compiled_match_core(
     cache.per_node[node_idx][pos] = CompiledCacheSlot::Done(result);
 
     if result.is_none() {
-        let node = &graph.nodes[node_idx];
-        update_error(py, node.expr.bind(py), pos, error)?;
+        if let Some(error) = error {
+            let node = &graph.nodes[node_idx];
+            update_error(py, node.expr.bind(py), pos, error)?;
+        }
     }
     Ok(result)
 }
@@ -639,7 +663,7 @@ fn compiled_uncached_match(
     text: &Bound<'_, PyAny>,
     pos: usize,
     cache: &mut CompiledCache,
-    error: &Bound<'_, PyAny>,
+    error: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Option<usize>> {
     let node = &graph.nodes[node_idx];
     match &node.kind {
@@ -738,35 +762,97 @@ fn compiled_uncached_match(
     }
 }
 
-fn compiled_build_tree(
+fn compiled_match_core_tree(
     py: Python<'_>,
     graph: &CompiledGraph,
     node_idx: usize,
     text: &Bound<'_, PyAny>,
     pos: usize,
-    cache: &mut CompiledCache,
-    error: &Bound<'_, PyAny>,
+    cache: &mut CompiledTreeCache,
+    error: Option<&Bound<'_, PyAny>>,
     arena: &mut Vec<NativeNode>,
 ) -> PyResult<Option<usize>> {
-    let end = compiled_match_core(py, graph, node_idx, text, pos, cache, error)?;
-    let Some(end) = end else {
+    if pos > cache.len {
         return Ok(None);
-    };
+    }
+    if node_idx >= graph.nodes.len() {
+        return Err(PyRuntimeError::new_err(
+            "Compiled tree matcher node index out of bounds.",
+        ));
+    }
 
+    match cache.per_node[node_idx][pos] {
+        CompiledTreeCacheSlot::Unknown => {
+            cache.per_node[node_idx][pos] = CompiledTreeCacheSlot::InProgress;
+        }
+        CompiledTreeCacheSlot::InProgress => {
+            let node = &graph.nodes[node_idx];
+            let ty = left_recursion_error_type(py)?;
+            let inst = ty.call1((text, -1isize, node.expr.bind(py)))?;
+            return Err(PyErr::from_value(inst));
+        }
+        CompiledTreeCacheSlot::Done(result) => {
+            return Ok(result);
+        }
+    }
+
+    let result = compiled_uncached_match_tree(py, graph, node_idx, text, pos, cache, error, arena)?;
+    cache.per_node[node_idx][pos] = CompiledTreeCacheSlot::Done(result);
+
+    if result.is_none() {
+        if let Some(error) = error {
+            let node = &graph.nodes[node_idx];
+            update_error(py, node.expr.bind(py), pos, error)?;
+        }
+    }
+    Ok(result)
+}
+
+fn compiled_uncached_match_tree(
+    py: Python<'_>,
+    graph: &CompiledGraph,
+    node_idx: usize,
+    text: &Bound<'_, PyAny>,
+    pos: usize,
+    cache: &mut CompiledTreeCache,
+    error: Option<&Bound<'_, PyAny>>,
+    arena: &mut Vec<NativeNode>,
+) -> PyResult<Option<usize>> {
     let node = &graph.nodes[node_idx];
     match &node.kind {
-        CompiledKind::TokenMatcher { .. } | CompiledKind::Literal { .. } => {
-            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, Vec::new());
-            Ok(Some(idx))
+        CompiledKind::TokenMatcher { literal } => {
+            if pos >= cache.len {
+                return Ok(None);
+            }
+            let item = text.get_item(pos)?;
+            let ty = item.getattr("type")?;
+            let ok: bool = ty.eq(literal.bind(py))?;
+            if ok {
+                let idx = push_plain_node(arena, node.expr.bind(py), pos, pos + 1, Vec::new());
+                return Ok(Some(idx));
+            }
+            Ok(None)
+        }
+        CompiledKind::Literal { literal } => {
+            let literal_any = literal.bind(py);
+            let ok: bool = text
+                .call_method1("startswith", (literal_any, pos))?
+                .extract()?;
+            if ok {
+                let lit_len = literal_any.len()?;
+                let idx =
+                    push_plain_node(arena, node.expr.bind(py), pos, pos + lit_len, Vec::new());
+                return Ok(Some(idx));
+            }
+            Ok(None)
         }
         CompiledKind::Regex { re } => {
             let re_any = re.bind(py);
             let m = re_any.call_method1("match", (text, pos))?;
             if m.is_none() {
-                return Err(PyRuntimeError::new_err(
-                    "Compiled tree builder expected regex match but got None.",
-                ));
+                return Ok(None);
             }
+            let end: usize = m.call_method0("end")?.extract()?;
             let idx = push_regex_node(arena, node.expr.bind(py), pos, end, m.unbind());
             Ok(Some(idx))
         }
@@ -774,7 +860,7 @@ fn compiled_build_tree(
             let mut new_pos = pos;
             let mut children: Vec<usize> = Vec::with_capacity(members.len());
             for member_idx in members {
-                let child = compiled_build_tree(
+                let child = compiled_match_core_tree(
                     py,
                     graph,
                     *member_idx,
@@ -785,58 +871,43 @@ fn compiled_build_tree(
                     arena,
                 )?;
                 let Some(child) = child else {
-                    return Err(PyRuntimeError::new_err(
-                        "Compiled tree builder sequence child unexpectedly failed.",
-                    ));
+                    return Ok(None);
                 };
                 new_pos = native_node_end(arena, child)?;
                 children.push(child);
             }
-            if new_pos != end {
-                return Err(PyRuntimeError::new_err(
-                    "Compiled tree builder sequence end mismatch.",
-                ));
-            }
-            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, children);
+            let idx = push_plain_node(arena, node.expr.bind(py), pos, new_pos, children);
             Ok(Some(idx))
         }
         CompiledKind::OneOf { members } => {
             for member_idx in members {
-                let child_end =
-                    compiled_match_core(py, graph, *member_idx, text, pos, cache, error)?;
-                if child_end.is_some() {
-                    let child = compiled_build_tree(
-                        py,
-                        graph,
-                        *member_idx,
-                        text,
-                        pos,
-                        cache,
-                        error,
-                        arena,
-                    )?;
-                    let Some(child) = child else {
-                        return Err(PyRuntimeError::new_err(
-                            "Compiled tree builder one-of child unexpectedly failed.",
-                        ));
-                    };
-                    let child_end = native_node_end(arena, child)?;
-                    if child_end != end {
-                        return Err(PyRuntimeError::new_err(
-                            "Compiled tree builder one-of end mismatch.",
-                        ));
-                    }
+                let child = compiled_match_core_tree(
+                    py,
+                    graph,
+                    *member_idx,
+                    text,
+                    pos,
+                    cache,
+                    error,
+                    arena,
+                )?;
+                if let Some(child) = child {
+                    let end = native_node_end(arena, child)?;
                     let idx = push_plain_node(arena, node.expr.bind(py), pos, end, vec![child]);
                     return Ok(Some(idx));
                 }
             }
-            Err(PyRuntimeError::new_err(
-                "Compiled tree builder could not choose one-of member.",
-            ))
+            Ok(None)
         }
-        CompiledKind::Lookahead { .. } => {
-            let idx = push_plain_node(arena, node.expr.bind(py), pos, pos, Vec::new());
-            Ok(Some(idx))
+        CompiledKind::Lookahead { member, negativity } => {
+            let child =
+                compiled_match_core_tree(py, graph, *member, text, pos, cache, error, arena)?;
+            let ok = (child.is_none()) == *negativity;
+            if ok {
+                let idx = push_plain_node(arena, node.expr.bind(py), pos, pos, Vec::new());
+                return Ok(Some(idx));
+            }
+            Ok(None)
         }
         CompiledKind::Quantifier { member, min, max } => {
             let mut new_pos = pos;
@@ -850,18 +921,13 @@ fn compiled_build_tree(
                     break;
                 }
 
-                let child_end =
-                    compiled_match_core(py, graph, *member, text, new_pos, cache, error)?;
-                let Some(child_end) = child_end else {
+                let child = compiled_match_core_tree(
+                    py, graph, *member, text, new_pos, cache, error, arena,
+                )?;
+                let Some(child) = child else {
                     break;
                 };
-                let child =
-                    compiled_build_tree(py, graph, *member, text, new_pos, cache, error, arena)?;
-                let Some(child) = child else {
-                    return Err(PyRuntimeError::new_err(
-                        "Compiled tree builder quantifier child unexpectedly failed.",
-                    ));
-                };
+                let child_end = native_node_end(arena, child)?;
                 let length = child_end.saturating_sub(new_pos);
                 children.push(child);
                 if children.len() >= *min && length == 0 {
@@ -869,19 +935,11 @@ fn compiled_build_tree(
                 }
                 new_pos = child_end;
             }
-
-            if children.len() < *min {
-                return Err(PyRuntimeError::new_err(
-                    "Compiled tree builder quantifier minimum mismatch.",
-                ));
+            if children.len() >= *min {
+                let idx = push_plain_node(arena, node.expr.bind(py), pos, new_pos, children);
+                return Ok(Some(idx));
             }
-            if new_pos != end {
-                return Err(PyRuntimeError::new_err(
-                    "Compiled tree builder quantifier end mismatch.",
-                ));
-            }
-            let idx = push_plain_node(arena, node.expr.bind(py), pos, end, children);
-            Ok(Some(idx))
+            Ok(None)
         }
     }
 }
@@ -1436,16 +1494,16 @@ impl Expression {
             }
         };
         let graph = compile_graph(py, &self_any)?;
-        let mut cache = CompiledCache::new(graph.nodes.len(), len);
+        let mut cache = CompiledTreeCache::new(graph.nodes.len(), len);
         let mut arena: Vec<NativeNode> = Vec::new();
-        let node_idx = compiled_build_tree(
+        let node_idx = compiled_match_core_tree(
             py,
             &graph,
             graph.root,
             text.bind(py),
             pos,
             &mut cache,
-            &error,
+            Some(&error),
             &mut arena,
         )?;
         let Some(node_idx) = node_idx else {
@@ -1467,9 +1525,9 @@ impl Expression {
         let mut visited: HashSet<usize> = HashSet::new();
         let has_custom = contains_custom_expr(py, &self_any, &mut visited)?;
 
-        let parse_error = parse_error_type(py)?;
-        let error = parse_error.call1((text.bind(py),))?;
         if has_custom {
+            let parse_error = parse_error_type(py)?;
+            let error = parse_error.call1((text.bind(py),))?;
             let cache: Bound<'_, PackratCache> =
                 Bound::new(py, PackratCache::from_text(py, text.clone_ref(py))?)?;
             let node = match_core_any(py, &self_any, text.bind(py), pos, &cache, &error)?;
@@ -1489,15 +1547,8 @@ impl Expression {
         };
         let graph = compile_graph(py, &self_any)?;
         let mut cache = CompiledCache::new(graph.nodes.len(), len);
-        let end = compiled_match_core(
-            py,
-            &graph,
-            graph.root,
-            text.bind(py),
-            pos,
-            &mut cache,
-            &error,
-        )?;
+        let end =
+            compiled_match_core(py, &graph, graph.root, text.bind(py), pos, &mut cache, None)?;
         let Some(end) = end else {
             return Ok(None);
         };

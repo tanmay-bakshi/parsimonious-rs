@@ -141,13 +141,27 @@ def _arith_case() -> BenchmarkCase:
     )
 
 
+def _tiny_case() -> BenchmarkCase:
+    """Build a tiny-input benchmark case for per-call overhead.
+
+    :returns: A benchmark case.
+    """
+
+    return BenchmarkCase(
+        name="tiny_literal",
+        grammar='start = "a"+',
+        text="a" * 32,
+        iterations=200000,
+    )
+
+
 def get_cases() -> dict[str, BenchmarkCase]:
     """Return benchmark cases keyed by case name.
 
     :returns: Mapping of benchmark cases.
     """
 
-    cases = [_json_case(), _log_case(), _arith_case()]
+    cases = [_json_case(), _log_case(), _arith_case(), _tiny_case()]
     return {case.name: case for case in cases}
 
 
