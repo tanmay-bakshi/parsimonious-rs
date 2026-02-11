@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "parsimonious-rs"
+version = "0.1.0"
+description = "A high-performance Rust implementation of the Parsimonious PEG parser, with Python bindings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Tanmay Bakshi"},
+]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[project.optional-dependencies]
+tests = [
+  "pytest",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "parsimonious._parsimonious_rs"
+manifest-path = "crates/parsimonious-py/Cargo.toml"
+features = ["pyo3/extension-module"]

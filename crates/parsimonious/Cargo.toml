@@ -1,0 +1,16 @@
+[package]
+name = "parsimonious"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+py_literal = "0.4.0"
+pcre2 = "0.2.11"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[[bench]]
+name = "json_like"
+harness = false

@@ -1,0 +1,16 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+
+# Virtualenvs
+.venv/
+
+# Tooling
+.DS_Store

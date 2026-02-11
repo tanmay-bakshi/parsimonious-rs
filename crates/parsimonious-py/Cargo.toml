@@ -1,0 +1,12 @@
+[package]
+name = "parsimonious-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_parsimonious_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.0", features = ["extension-module"] }
+parsimonious = { path = "../parsimonious" }
