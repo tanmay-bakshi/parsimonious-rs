@@ -29,3 +29,9 @@ python-source = "python"
 module-name = "parsimonious._parsimonious_rs"
 manifest-path = "crates/parsimonious-py/Cargo.toml"
 features = ["pyo3/extension-module"]
+exclude = [
+  "python/parsimonious/*.so",
+  "python/parsimonious/*.dylib",
+  "python/parsimonious/*.dll",
+  "python/parsimonious/*.pyd",
+]
